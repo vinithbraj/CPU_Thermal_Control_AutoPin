@@ -54,10 +54,10 @@ def get_socket_core_map() -> Dict[int, List[int]]:
 
 
 # ---------------------------------------------------------
-#   Read CPU temperatures via lm-sensors
+#   Read CPU package temperatures via lm-sensors
 # ---------------------------------------------------------
 def read_socket_temperatures() -> Dict[int, float]:
-    temps = {}
+    temps: Dict[int, float] = {}
 
     try:
         out = subprocess.check_output(["sensors"], text=True)
@@ -67,6 +67,7 @@ def read_socket_temperatures() -> Dict[int, float]:
     current_socket = None
 
     for line in out.splitlines():
+        line = line.strip()
         if "Package id 0:" in line:
             current_socket = 0
         elif "Package id 1:" in line:
@@ -78,7 +79,7 @@ def read_socket_temperatures() -> Dict[int, float]:
                 temps[current_socket] = temp_val
                 current_socket = None
             except Exception:
-                pass
+                current_socket = None
 
     return temps
 
@@ -104,7 +105,7 @@ class ProcessTableModel(QtCore.QAbstractTableModel):
                     "name": p.info.get("name", ""),
                     "user": p.info.get("username", ""),
                     "cpu": cpu,
-                    "aff": aff_str
+                    "aff": aff_str,
                 })
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -129,11 +130,16 @@ class ProcessTableModel(QtCore.QAbstractTableModel):
         col = index.column()
 
         if role == QtCore.Qt.ItemDataRole.DisplayRole:
-            if col == 0: return str(row["pid"])
-            if col == 1: return row["name"]
-            if col == 2: return row["user"]
-            if col == 3: return f"{row['cpu']:.1f}"
-            if col == 4: return row["aff"]
+            if col == 0:
+                return str(row["pid"])
+            if col == 1:
+                return row["name"]
+            if col == 2:
+                return row["user"]
+            if col == 3:
+                return f"{row['cpu']:.1f}"
+            if col == 4:
+                return row["aff"]
 
         return None
 
@@ -170,8 +176,10 @@ class TempTableModel(QtCore.QAbstractTableModel):
         col = index.column()
 
         if role == QtCore.Qt.ItemDataRole.DisplayRole:
-            if col == 0: return str(row["socket"])
-            if col == 1: return f"{row['temp']:.1f}"
+            if col == 0:
+                return str(row["socket"])
+            if col == 1:
+                return f"{row['temp']:.1f}"
 
         return None
 
@@ -189,21 +197,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("CPU Affinity Manager")
         self.statusBar()
 
-        # Tracks CPU usage duration
+        # Track CPU usage durations & autopinned PIDs
         self.high_usage_counter: Dict[int, int] = {}
+        self.autopinned_pids = set()
 
-        # Load saved settings
+        # Cooler socket & tray icon state
+        self.current_cooler_socket = None
+        self.last_icon_state = None
+
+        # Settings
         self.settings = self._load_settings()
 
+        # ---------------- GUI LAYOUT ----------------
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
 
-        # ---------------- SOCKET INFO ----------------
+        # Socket info
         self.socket_label = QtWidgets.QLabel(self._format_socket_info())
         layout.addWidget(self.socket_label)
 
-        # ---------------- TEMPERATURE TABLE ----------------
+        # Temperature table
         layout.addWidget(QtWidgets.QLabel("CPU Socket Temperatures:"))
         self.temp_model = TempTableModel(self)
         self.temp_view = QtWidgets.QTableView()
@@ -211,24 +225,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.temp_view.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.temp_view)
 
-        # ---------------- CHECKBOXES ----------------
+        # Per-core loads (sorted, hides 0%)
+        layout.addWidget(QtWidgets.QLabel("Per-core CPU Load:"))
+        self.core_table = QtWidgets.QTableWidget()
+        self.core_table.setColumnCount(2)
+        self.core_table.setHorizontalHeaderLabels(["Core", "Load %"])
+        self.core_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.core_table)
+
+        # Checkboxes
         self.chk_pause = QtWidgets.QCheckBox("Pause updates")
         self.chk_pause.setChecked(self.settings.get("pause", False))
         layout.addWidget(self.chk_pause)
 
         self.chk_auto_heavy = QtWidgets.QCheckBox(
-            "Auto-pin any process >100% CPU for 10 seconds → Socket 0"
+            "Auto-pin any process >100% CPU for 10 seconds → cooler socket"
         )
         self.chk_auto_heavy.setChecked(self.settings.get("auto_heavy", False))
         layout.addWidget(self.chk_auto_heavy)
 
-        # ---------------- EXIT BUTTON ----------------
+        # Exit button
         self.btn_exit_full = QtWidgets.QPushButton("Exit Application")
-        self.btn_exit_full.setStyleSheet("background-color: #b33a3a; color: white;")
+        self.btn_exit_full.setStyleSheet("background-color:#b33a3a; color:white;")
         layout.addWidget(self.btn_exit_full)
         self.btn_exit_full.clicked.connect(self.exit_application)
 
-        # ---------------- PROCESS TABLE ----------------
+        # Process table
         layout.addWidget(QtWidgets.QLabel("Processes:"))
         self.table_model = ProcessTableModel(self)
         self.table_view = QtWidgets.QTableView()
@@ -236,18 +258,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table_view.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table_view)
 
-        # ---------------- MANUAL PIN BUTTONS ----------------
-        btn_layout = QtWidgets.QHBoxLayout()
+        # Manual pin buttons
+        btn_l = QtWidgets.QHBoxLayout()
         self.btn_pin_socket0 = QtWidgets.QPushButton("Pin → Socket 0")
         self.btn_pin_socket1 = QtWidgets.QPushButton("Pin → Socket 1")
-        btn_layout.addWidget(self.btn_pin_socket0)
-        btn_layout.addWidget(self.btn_pin_socket1)
-        layout.addLayout(btn_layout)
+        btn_l.addWidget(self.btn_pin_socket0)
+        btn_l.addWidget(self.btn_pin_socket1)
+        layout.addLayout(btn_l)
 
         self.btn_pin_socket0.clicked.connect(self.pin_socket0)
         self.btn_pin_socket1.clicked.connect(self.pin_socket1)
 
-        # ---------------- TIMERS ----------------
+        # Timers
         self.update_timer = QtCore.QTimer(self)
         self.update_timer.timeout.connect(self.refresh_all)
         self.update_timer.start(2000)
@@ -256,11 +278,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autopin_timer.timeout.connect(self.autopin_tick)
         self.autopin_timer.start(1000)
 
-        # ---------------- TRAY ICON ----------------
+        # Tray icon
         self.tray_icon = self._create_tray_icon()
         self.tray_icon.show()
 
-    # ---------------- SETTINGS ----------------
+    # ---------------------------------------------------------
+    # SETTINGS
+    # ---------------------------------------------------------
     def _load_settings(self):
         if os.path.exists(CONFIG_PATH):
             try:
@@ -281,22 +305,25 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    # ---------------- TRAY ICON ----------------
-    def _create_tray_icon(self):
+    # ---------------------------------------------------------
+    # TRAY ICON
+    # ---------------------------------------------------------
+    def _make_icon_pixmap(self, char, color):
         pix = QPixmap(32, 32)
         pix.fill(QtCore.Qt.GlobalColor.transparent)
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        font = QFont()
-        font.setPointSize(18)
-        painter.setFont(font)
-
-        painter.setPen(QtCore.Qt.GlobalColor.white)
-        painter.drawText(pix.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "❄")
+        f = QFont()
+        f.setPointSize(18)
+        painter.setFont(f)
+        painter.setPen(color)
+        painter.drawText(pix.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, char)
         painter.end()
+        return pix
 
-        icon = QIcon(pix)
-        tray = QtWidgets.QSystemTrayIcon(icon, self)
+    def _create_tray_icon(self):
+        pix = self._make_icon_pixmap("C", QtCore.Qt.GlobalColor.white)
+        tray = QtWidgets.QSystemTrayIcon(QIcon(pix), self)
 
         menu = QtWidgets.QMenu()
 
@@ -314,18 +341,47 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addAction(act_quit)
 
         tray.setContextMenu(menu)
-
         tray.activated.connect(self._tray_click)
+
+        tray.setToolTip("CPU Affinity Manager")
         return tray
+
+    def _update_tray_icon(self, max_temp):
+        if max_temp is None:
+            state = "idle"
+            char = "C"
+            col = QtCore.Qt.GlobalColor.white
+        else:
+            if max_temp <= 55:
+                state = "cool"
+                char = "C"
+                col = QtCore.Qt.GlobalColor.white
+            elif max_temp <= 70:
+                state = "warm"
+                char = "W"
+                col = QtCore.Qt.GlobalColor.white
+            else:
+                state = "hot"
+                char = "H"
+                col = QtCore.Qt.GlobalColor.red
+
+        if state == self.last_icon_state:
+            return
+
+        pix = self._make_icon_pixmap(char, col)
+        self.tray_icon.setIcon(QIcon(pix))
+        if max_temp is not None:
+            self.tray_icon.setToolTip(f"Max temp: {max_temp:.1f} °C")
+        else:
+            self.tray_icon.setToolTip("CPU Affinity Manager")
+        self.last_icon_state = state
 
     def _tray_click(self, reason):
         if reason == QtWidgets.QSystemTrayIcon.ActivationReason.Trigger:
             if self.isVisible():
                 self.hide()
             else:
-                self.showNormal()
-                self.raise_()
-                self.activateWindow()
+                self.show_from_tray()
 
     def show_from_tray(self):
         self.showNormal()
@@ -335,16 +391,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def hide_from_tray(self):
         self.hide()
 
-    # ---------------- FORMATTING ----------------
+    # ---------------------------------------------------------
+    # FORMAT SOCKET INFO
+    # ---------------------------------------------------------
     def _format_socket_info(self):
-        out = ""
+        lines = []
         for s, cores in sorted(self.socket_map.items()):
-            out += f"Socket {s}: {', '.join(map(str, cores))}\n"
-        return out
+            core_list = ", ".join(str(c) for c in cores)
+            lines.append(f"Socket {s}: {core_list}")
+        return "\n".join(lines)
 
-    # ---------------- EXIT APPLICATION ----------------
+    # ---------------------------------------------------------
+    # EXIT HANDLING
+    # ---------------------------------------------------------
     def exit_application(self):
-        print("[EXIT] Shutting down application...")
+        print("[EXIT] Closing application...")
         self._save_settings()
 
         try:
@@ -354,26 +415,103 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             self.update_timer.stop()
+        except Exception:
+            pass
+
+        try:
             self.autopin_timer.stop()
         except Exception:
             pass
 
         QtWidgets.QApplication.quit()
 
-    # ---------------- CLOSE WINDOW → MINIMIZE TO TRAY ----------------
     def closeEvent(self, event):
         event.ignore()
         self.hide()
         self.statusBar().showMessage("Still running in tray.", 3000)
 
-    # ---------------- UPDATES ----------------
+    # ---------------------------------------------------------
+    # UPDATE FUNCTIONS
+    # ---------------------------------------------------------
     def refresh_all(self):
-        if not self.chk_pause.isChecked():
-            temps = read_socket_temperatures()
-            self.temp_model.update(temps)
-            self.table_model.update()
+        if self.chk_pause.isChecked():
+            return
 
-    # ---------------- MANUAL AFFINITY ----------------
+        # Socket temps
+        temps = read_socket_temperatures()
+        self.temp_model.update(temps)
+
+        # Determine cooler socket
+        new_cooler = None
+        if temps:
+            new_cooler = min(temps.keys(), key=lambda s: temps[s])
+        else:
+            if 0 in self.socket_map:
+                new_cooler = 0
+
+        # If cooler socket changed, re-pin auto-managed PIDs
+        if new_cooler != self.current_cooler_socket:
+            old = self.current_cooler_socket
+            self.current_cooler_socket = new_cooler
+            if old is not None and new_cooler is not None:
+                self._on_cooler_socket_changed(old, new_cooler)
+
+        # Update tray icon
+        max_temp = max(temps.values()) if temps else None
+        self._update_tray_icon(max_temp)
+
+        # Per-core loads
+        self._update_core_loads()
+
+        # Process table
+        self.table_model.update()
+
+    def _update_core_loads(self):
+        percs = psutil.cpu_percent(interval=None, percpu=True)
+
+        # Keep only active cores, sort by descending usage
+        core_data = [(i, p) for i, p in enumerate(percs) if p > 0]
+        core_data.sort(key=lambda x: x[1], reverse=True)
+
+        self.core_table.setRowCount(len(core_data))
+
+        for row, (core_id, val) in enumerate(core_data):
+            item = QtWidgets.QTableWidgetItem(str(core_id))
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.core_table.setItem(row, 0, item)
+
+            bar = QtWidgets.QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(int(val))
+            bar.setTextVisible(True)
+            self.core_table.setCellWidget(row, 1, bar)
+
+    # ---------------------------------------------------------
+    # COOLER SOCKET CHANGE HANDLING
+    # ---------------------------------------------------------
+    def _on_cooler_socket_changed(self, old_socket, new_socket):
+        print(f"[INFO] Cooler socket changed {old_socket} → {new_socket}")
+        target = self.socket_map.get(new_socket)
+        if not target:
+            return
+
+        for pid in list(self.autopinned_pids):
+            try:
+                psutil.Process(pid).cpu_affinity(target)
+                print(f"[RE-PIN] PID {pid} moved to socket {new_socket}")
+            except psutil.NoSuchProcess:
+                self.autopinned_pids.discard(pid)
+            except Exception:
+                continue
+
+        self.statusBar().showMessage(
+            f"Cooler socket is now {new_socket}. Re-pinned auto-managed processes.",
+            5000,
+        )
+
+    # ---------------------------------------------------------
+    # MANUAL PIN BUTTONS
+    # ---------------------------------------------------------
     def selected_pid(self):
         sel = self.table_view.selectionModel().selectedRows()
         if not sel:
@@ -382,22 +520,37 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def pin_socket0(self):
         pid = self.selected_pid()
-        if pid >= 0:
-            psutil.Process(pid).cpu_affinity(self.socket_map[0])
+        if pid >= 0 and 0 in self.socket_map:
+            try:
+                psutil.Process(pid).cpu_affinity(self.socket_map[0])
+            except Exception:
+                pass
             self.refresh_all()
 
     def pin_socket1(self):
         pid = self.selected_pid()
-        if pid >= 0:
-            psutil.Process(pid).cpu_affinity(self.socket_map[1])
+        if pid >= 0 and 1 in self.socket_map:
+            try:
+                psutil.Process(pid).cpu_affinity(self.socket_map[1])
+            except Exception:
+                pass
             self.refresh_all()
 
-    # ---------------- AUTO-PIN ENGINE ----------------
+    # ---------------------------------------------------------
+    # AUTO-PIN ENGINE
+    # ---------------------------------------------------------
     def autopin_tick(self):
         if not self.chk_auto_heavy.isChecked():
             return
 
-        target = self.socket_map.get(0)
+        cooler = self.current_cooler_socket
+        if cooler is None:
+            if 0 in self.socket_map:
+                cooler = 0
+            else:
+                return
+
+        target = self.socket_map.get(cooler)
         if not target:
             return
 
@@ -416,32 +569,31 @@ class MainWindow(QtWidgets.QMainWindow):
                     name = p.info.get("name", "?")
 
                     print(
-                        f"[AUTO-PIN] {pid} ({name}) >100% CPU "
-                        f"for {self.HIGH_CPU_DURATION}s → pinned to Socket 0"
+                        f"[AUTO-PIN] {pid} ({name}) >{self.HIGH_CPU_THRESHOLD}% for "
+                        f"{self.HIGH_CPU_DURATION}s → socket {cooler}"
                     )
                     self.statusBar().showMessage(
-                        f"Auto-pinned {pid} ({name}) to Cooler CPU (Socket 0)", 5000
+                        f"Auto-pinned {pid} ({name}) to socket {cooler}",
+                        5000,
                     )
 
                     self.high_usage_counter[pid] = 0
+                    self.autopinned_pids.add(pid)
 
             except Exception:
                 continue
 
 
 # ---------------------------------------------------------
-#   MAIN
+#   MAIN ENTRY
 # ---------------------------------------------------------
 def main():
     socket_map = get_socket_core_map()
-
     app = QtWidgets.QApplication(sys.argv)
-
-    # Create window (starts minimized to tray)
     w = MainWindow(socket_map)
-
-    # Do NOT show window on startup
-    # user can click tray icon or use "Show" menu
+    # Start minimized to tray: don't show the window initially
+    # (uncomment next line if you want it visible on start)
+    # w.show()
     sys.exit(app.exec())
 
 
